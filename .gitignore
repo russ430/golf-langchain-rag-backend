@@ -6,3 +6,4 @@ uploads/
 chroma_db/
 venv/
 lib/
+metadata.db
