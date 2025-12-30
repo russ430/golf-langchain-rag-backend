@@ -4,34 +4,28 @@ import sqlite3
 from typing import List, Union, Optional
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_community.llms import Ollama
 
 # REAL AI & INTEGRATION IMPORTS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_ollama import OllamaLLM
+from langchain_core.prompts import ChatPromptTemplate
 
 SYSTEM_PROMPT = """
 ### ROLE
-You are a Leadbetter-certified Senior Golf Biomechanics Consultant. You specialize in analyzing swing faults using empirical research data. 
+Certified Golf Biomechanics Consultant.
 
 ### CONSTRAINTS
-1. ONLY use the provided [RESEARCH_CONTEXT] to answer. 
-2. If the answer isn't in the context, say: "Based on the current research library, I cannot confidently diagnose this. Please upload more papers on [Missing Topic]."
-3. Do not mention that you are an AI. 
-4. Use professional, technical golf terminology (e.g., 'kinematic sequence', 'ground reaction forces').
+1. ANSWER ONLY using [CONTEXT FROM RESEARCH].
+2. BE CONCISE. Use bullet points. Limit response to under 200 words.
+3. If the context doesn't have the answer, state: "Insufficient research data for this fault."
 
-### ANALYSIS STEPS (Chain-of-Thought)
-Follow these steps in your response:
-1. **Research Synthesis**: Summarize what the uploaded papers say about the specific swing fault mentioned.
-2. **Biomechanical Link**: Explain the 'Why'. Why might this body fault cause the specific ball flight issue? Consider multiple potential biomechanical mechanisms and their relative likelihood. If none are apparent in the research, state so.
-3. **Prescription**: Suggest 1 specific drill or 'feel' based on the research (where applicable).
-
-### OUTPUT FORMAT
-- **Research Summary**: [Step 1]
-- **Biomechanical Breakdown**: [Step 2]
-- **Coaching Drill**: [Step 3]
+### STRUCTURE
+- **Finding**: One sentence summarizing research.
+- **Mechanism**: One sentence on biomechanics.
+- **Drill**: One actionable 'feel' or drill.
 """
 
 app = FastAPI()
@@ -74,28 +68,31 @@ vector_db = Chroma(
 
 # 3. THE INGESTION LOGIC (The "Background Task")
 def process_pdf(file_path: str, file_id: str):
-    """
-    This function runs in the background. It reads the PDF, 
-    chops it into pieces, and saves it into the Vector DB.
-    """
     try:
         print(f"📖 Starting processing for: {file_path}")
-        
-        # Load the PDF
         loader = PyPDFLoader(file_path)
         pages = loader.load()
         
-        # Split text into 1000-character chunks with 150-character overlap
-        # Overlap ensures context (like a specific golf drill) isn't cut in half
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         chunks = text_splitter.split_documents(pages)
         
-        # Add to our local Vector DB
         vector_db.add_documents(chunks)
+        
+        # --- ADD THIS SQL UPDATE ---
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE files SET status = 'completed' WHERE id = ?", (file_id,))
+        conn.commit()
+        conn.close()
+        # ---------------------------
         
         print(f"✅ SUCCESSFULLY VECTORIZED {len(chunks)} chunks from {file_path}")
     except Exception as e:
         print(f"❌ ERROR PROCESSING PDF: {str(e)}")
+        # Optional: Update status to 'error' if it fails
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE files SET status = 'error' WHERE id = ?", (file_id,))
+        conn.commit()
+        conn.close()
 
 # 4. PDF UPLOAD ENDPOINT
 @app.post("/upload")
@@ -119,8 +116,6 @@ async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
                  (file_id, file.filename, "processing"))
     conn.commit()
     conn.close()
-
-    return {"success": True, "fileId": file_id}
     
     return {
         "success": True, 
@@ -134,7 +129,7 @@ async def analyze_swing(payload: dict = Body(...)):
     notes = payload.get("notes", "")
     
     # 1. Retrieve the top 3 most relevant chunks from your PDF library
-    docs = vector_db.similarity_search(notes, k=3)
+    docs = vector_db.similarity_search(notes, k=5)
     context_text = "\n\n".join([doc.page_content for doc in docs])
 
     # 2. Build the final prompt using the System Prompt + Context + Query
